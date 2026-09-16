@@ -1,0 +1,990 @@
+#!/usr/bin/env python3
+# -*- coding: utf-8 -*-
+"""clses — 列出/查看/恢复/删除 Claude Code 会话。
+
+用法:
+  clses                          列出当前项目(目录)的会话
+  clses N                        恢复第 N 个会话 (claude --resume <完整ID>)
+  clses -x N, --view N           展开第 N 个会话的全文对话
+  clses -d N, --delete N         删除第 N 个会话(移入回收站; -y 跳过确认)
+  clses --restore [N]            恢复第 N 个; 省略 N 则列出回收站内容(让你看清该恢复哪个)
+  clses --trash                  列出回收站中的会话 (等价于 --restore 不带序号)
+  clses -a, --all                列出所有项目的会话
+  clses -p PATH, --project PATH  列出指定目录的会话
+  clses -f, --full               加宽"主题/最后对话"列
+  clses -g PAT, --grep PAT       按关键词过滤(主题/最后对话)
+  clses -t RANGE, --time RANGE   按时间过滤: today / 1h / 7d / 30d / 2w
+  clses --sort KEY               排序: time(默认) / oldest / size / turns
+  clses --json / --csv           以 JSON/CSV 输出(供管道/脚本)
+  clses -y, --yes                删除时跳过确认
+  clses -h, --help               帮助
+
+说明:
+  - 序号(N)对应"最近一次列表"的结果; 过滤/排序/项目范围都会重排编号,
+    因此 `clses -g 维语` 之后 `clses 3` = 恢复第 3 个匹配项。
+  - 文本列宽按终端宽度动态调整(主题≈1/3、最后对话≈2/3), 管道输出回退 120 列。
+  - 颜色仅当输出到终端(tty)时启用, 管道自动关闭。
+  - 删除是"移入回收站"而非 rm: ~/.claude/.clses-trash/ 下保留原文件, 可 --restore 恢复。
+  - 正在运行的会话(读 ~/.claude/sessions/ 且 PID 存活)拒绝删除。
+
+数据源: ~/.claude/projects/<cwd编码>/*.jsonl
+       编码: cwd 里所有非字母数字字符 -> '-'  (不只是 /, 还有 . _ 等)
+       例: /data/server-ops -> -data-server-ops
+           /home/qd/.claude -> -home-qd--claude
+           /data/bysy_baobiao -> -data-bysy-baobiao
+依赖: 仅 Python 标准库。
+"""
+import sys
+import os
+import re
+import json
+import glob
+import shutil
+import csv
+import unicodedata
+from datetime import datetime, timezone, timedelta
+
+CLAUDE_DIR = os.path.expanduser("~/.claude")
+PROJECTS_DIR = os.path.join(CLAUDE_DIR, "projects")
+CACHE_FILE = os.path.join(CLAUDE_DIR, ".clses-cache.json")
+TRASH_DIR = os.path.join(CLAUDE_DIR, ".clses-trash")
+
+# 文本列宽度区间(显示宽度, CJK算2): 最小 / 默认上限 / --full上限
+TOPIC_MIN, TOPIC_MAX, TOPIC_MAX_FULL = 8, 52, 100
+LAST_MIN, LAST_MAX, LAST_MAX_FULL = 12, 120, 240
+PROJ_W = 14
+SID_W = 36
+TERM_FALLBACK = 120
+
+_COLOR = sys.stdout.isatty()  # 仅终端输出时启用颜色
+
+
+# ---------------- CJK 宽度感知的字符串工具 ----------------
+def wcw(c):
+    """单个字符的显示宽度: 全角/CJK 算 2, 其余 1"""
+    return 2 if unicodedata.east_asian_width(c) in ("W", "F") else 1
+
+
+def swidth(s):
+    return sum(wcw(c) for c in s)
+
+
+def ellipsize(s, width):
+    """按显示宽度截断, 超宽追加 '…'(算1)"""
+    if width <= 0:
+        return ""
+    if swidth(s) <= width:
+        return s
+    out = []
+    w = 0
+    for c in s:
+        cw = wcw(c)
+        if w + cw > width - 1:
+            break
+        out.append(c)
+        w += cw
+    out.append("…")
+    return "".join(out)
+
+
+def ljust(s, width):
+    s = ellipsize(s, width)
+    return s + " " * (width - swidth(s))
+
+
+def rjust(s, width):
+    s = ellipsize(s, width)
+    return " " * (width - swidth(s)) + s
+
+
+# ---------------- 颜色 ----------------
+def c(code, s):
+    if _COLOR:
+        return f"\033[{code}m{s}\033[0m"
+    return s
+
+
+# ---------------- 会话解析 ----------------
+def extract_text(content):
+    """从 message.content 提取纯文本(str 或 list)"""
+    if isinstance(content, str):
+        return content
+    if isinstance(content, list):
+        parts = []
+        for item in content:
+            if isinstance(item, dict) and item.get("type") == "text":
+                parts.append(item.get("text", ""))
+        return " ".join(parts)
+    return ""
+
+
+def is_meta_or_command(d):
+    """是否为元消息/命令消息(不算真实用户输入)"""
+    if d.get("isMeta"):
+        return True
+    txt = extract_text(d.get("message", {}).get("content", "")).lstrip()
+    return txt.startswith((
+        "<command-name>", "<local-command", "<command-message>", "<command-args>",
+    ))
+
+
+def is_tool_result_only(d):
+    """user 消息内容是否全是 tool_result(工具回传, 非用户输入)"""
+    c_ = d.get("message", {}).get("content")
+    if isinstance(c_, list) and c_ and all(
+        isinstance(x, dict) and x.get("type") == "tool_result" for x in c_
+    ):
+        return True
+    return False
+
+
+def clean_prompt(s):
+    """折叠空白, 便于单行表格展示"""
+    return " ".join(s.split())
+
+
+def parse_session(path):
+    """解析单个 .jsonl 会话文件, 提取摘要字段"""
+    sid = os.path.basename(path)[:-6]  # 去掉 .jsonl
+    first_prompt = ""
+    last_prompt = ""
+    last_prompt_field = ""
+    turns = 0
+    first_ts = None
+    last_ts = None
+    cwd = ""
+    try:
+        size = os.path.getsize(path)
+    except OSError:
+        size = 0
+
+    try:
+        f = open(path, "r", encoding="utf-8", errors="replace")
+    except OSError:
+        return None
+    with f:
+        for line in f:
+            line = line.strip()
+            if not line:
+                continue
+            try:
+                d = json.loads(line)
+            except json.JSONDecodeError:
+                continue
+            t = d.get("type")
+            ts = d.get("timestamp")
+            if ts:
+                try:
+                    dt = datetime.fromisoformat(ts.replace("Z", "+00:00"))
+                    if first_ts is None:
+                        first_ts = dt
+                    last_ts = dt
+                except (ValueError, TypeError):
+                    pass
+            if d.get("cwd") and not cwd:
+                cwd = d["cwd"]
+            if t == "last-prompt" and d.get("lastPrompt"):
+                last_prompt_field = d["lastPrompt"]
+            if t == "user" and not is_meta_or_command(d) and not is_tool_result_only(d):
+                txt = extract_text(d["message"]["content"]).strip()
+                if txt:
+                    if not first_prompt:
+                        first_prompt = txt
+                    last_prompt = txt
+            if t == "assistant" and not d.get("isApiErrorMessage"):
+                turns += 1
+
+    final_last = last_prompt_field or last_prompt
+    if last_ts is None:
+        mt = os.path.getmtime(path)
+        last_ts = datetime.fromtimestamp(mt, tz=timezone.utc)
+        first_ts = last_ts
+
+    return {
+        "sid": sid,
+        "path": path,
+        "first_prompt": first_prompt,
+        "last_prompt": final_last,
+        "turns": turns,
+        "first_ts": first_ts,
+        "last_ts": last_ts,
+        "cwd": cwd,
+        "size": size,
+    }
+
+
+# ---------------- 项目发现 ----------------
+def encode_cwd(cwd):
+    """Claude Code 的项目目录编码: 把 cwd 里所有非字母数字字符换成 '-'
+    例: /data/server-ops -> -data-server-ops
+        /home/qd/.claude -> -home-qd--claude   (点也被换成 -)
+        /data/bysy_baobiao -> -data-bysy-baobiao (下划线也被换成 -)
+    """
+    return re.sub(r"[^a-zA-Z0-9]", "-", cwd)
+
+
+def project_dir_for(cwd):
+    return os.path.join(PROJECTS_DIR, encode_cwd(cwd))
+
+
+def list_project_sessions(proj_dir):
+    if not os.path.isdir(proj_dir):
+        return []
+    return glob.glob(os.path.join(proj_dir, "*.jsonl"))
+
+
+def list_all_sessions():
+    files = []
+    for d in sorted(glob.glob(os.path.join(PROJECTS_DIR, "*"))):
+        if os.path.isdir(d):
+            files.extend(glob.glob(os.path.join(d, "*.jsonl")))
+    return files
+
+
+# ---------------- 表格渲染 ----------------
+def render_table(headers, aligns, widths, rows, colors=None):
+    """渲染带边框的表格, CJK 宽度对齐
+    widths: 每列固定宽度(数字)
+    colors: 与 [表头行] + rows 对应的二维颜色码列表, 用于按行/按列上色
+    """
+    n = len(headers)
+    cw = [widths[i] for i in range(n)]
+
+    def fmt(val, i, j):
+        s = str(val)
+        w = cw[i]
+        padded = rjust(s, w) if aligns[i] == "r" else ljust(s, w)
+        if colors and j < len(colors) and i < len(colors[j]):
+            code = colors[j][i]
+            if code:
+                return c(code, padded)
+        return padded
+
+    def border(left, mid, right):
+        return left + mid.join("─" * (cw[i] + 2) for i in range(n)) + right
+
+    lines = [border("┌", "┬", "┐")]
+    lines.append("│ " + " │ ".join(fmt(headers[i], i, 0) for i in range(n)) + " │")
+    lines.append(border("├", "┼", "┤"))
+    for j, r in enumerate(rows, 1):
+        lines.append("│ " + " │ ".join(fmt(r[i], i, j) for i in range(n)) + " │")
+    lines.append(border("└", "┴", "┘"))
+    return "\n".join(lines)
+
+
+def format_time(dt):
+    if dt is None:
+        return ""
+    local = dt.astimezone()
+    now = datetime.now().astimezone()
+    if local.year == now.year:
+        return local.strftime("%m-%d %H:%M")
+    return local.strftime("%Y-%m-%d")
+
+
+def short_project(cwd):
+    if not cwd:
+        return "?"
+    parts = cwd.rstrip("/").split("/")
+    tail = "/".join(parts[-2:]) if len(parts) >= 2 else (parts[-1] if parts else "?")
+    return tail or "?"
+
+
+def parse_dt(s):
+    if not s:
+        return None
+    try:
+        return datetime.fromisoformat(s)
+    except (ValueError, TypeError):
+        return None
+
+
+def compute_widths(all_projects, full):
+    """按终端宽度动态计算"主题/最后对话"两列宽度, 返回 (topic_w, last_w)"""
+    term = shutil.get_terminal_size((TERM_FALLBACK, 40)).columns
+    n = 7 if all_projects else 6
+    overhead = 4 + 3 * (n - 1)  # 边框与格内空隙
+    fixed = 3 + SID_W + 4 + 11  # # + SessionID + 轮次 + 最后活动
+    if all_projects:
+        fixed += PROJ_W
+    available = term - overhead - fixed
+
+    topic_max = TOPIC_MAX_FULL if full else TOPIC_MAX
+    last_max = LAST_MAX_FULL if full else LAST_MAX
+    topic_w = min(topic_max, max(TOPIC_MIN, available // 3))
+    last_w = min(last_max, max(LAST_MIN, available - topic_w))
+    return topic_w, last_w
+
+
+# ---------------- 活跃会话检测 ----------------
+def _pid_alive(pid):
+    if not pid:
+        return False
+    try:
+        os.kill(pid, 0)
+        return True
+    except ProcessLookupError:
+        return False
+    except PermissionError:
+        return True
+    except OSError:
+        return False
+
+
+def active_session_ids():
+    """正在运行的交互式会话 ID 集合(读 ~/.claude/sessions/*.json, 且 PID 仍存活)"""
+    ids = set()
+    for f in glob.glob(os.path.join(CLAUDE_DIR, "sessions", "*.json")):
+        try:
+            with open(f, "r", encoding="utf-8") as fh:
+                d = json.load(fh)
+            sid = d.get("sessionId")
+            if sid and _pid_alive(d.get("pid")):
+                ids.add(sid)
+        except (OSError, json.JSONDecodeError):
+            continue
+    return ids
+
+
+# ---------------- 回收站 ----------------
+def list_trash():
+    """列出回收站条目, 返回 [(entry_dir, meta), ...], 最新删除在前"""
+    entries = []
+    if not os.path.isdir(TRASH_DIR):
+        return entries
+    for name in sorted(os.listdir(TRASH_DIR)):
+        d = os.path.join(TRASH_DIR, name)
+        meta_path = os.path.join(d, "meta.json")
+        if os.path.isdir(d) and os.path.exists(meta_path):
+            try:
+                with open(meta_path, "r", encoding="utf-8") as fh:
+                    meta = json.load(fh)
+                entries.append((d, meta))
+            except (OSError, json.JSONDecodeError):
+                continue
+    entries.reverse()
+    return entries
+
+
+def dir_size(path):
+    total = 0
+    if os.path.isfile(path):
+        try:
+            total += os.path.getsize(path)
+        except OSError:
+            pass
+    elif os.path.isdir(path):
+        for root, _, fs in os.walk(path):
+            for fn in fs:
+                try:
+                    total += os.path.getsize(os.path.join(root, fn))
+                except OSError:
+                    pass
+    return total
+
+
+def move_to_trash(sid, target_cwd, jsonl, sibdir):
+    """把会话移入回收站, 返回 (moved_list, meta, entry_dir)"""
+    epoch = int(datetime.now().timestamp())
+    entry = os.path.join(TRASH_DIR, f"{epoch}_{sid}")
+    os.makedirs(entry, exist_ok=True)
+    meta = {
+        "sid": sid,
+        "cwd": target_cwd,
+        "original_jsonl": jsonl,
+        "had_attachments": os.path.isdir(sibdir),
+        "trash_time": datetime.now().astimezone().isoformat(),
+    }
+    moved = []
+    if os.path.isfile(jsonl):
+        shutil.move(jsonl, os.path.join(entry, sid + ".jsonl"))
+        moved.append(jsonl)
+    if os.path.isdir(sibdir):
+        shutil.move(sibdir, os.path.join(entry, "attachments"))
+        moved.append(sibdir)
+    with open(os.path.join(entry, "meta.json"), "w", encoding="utf-8") as fh:
+        json.dump(meta, fh, ensure_ascii=False, indent=2)
+    return moved, meta, entry
+
+
+def restore_from_trash(entry):
+    """从回收站恢复一个条目, 返回恢复的文件列表"""
+    meta_path = os.path.join(entry, "meta.json")
+    with open(meta_path, "r", encoding="utf-8") as fh:
+        meta = json.load(fh)
+    dest = os.path.dirname(meta["original_jsonl"])
+    os.makedirs(dest, exist_ok=True)
+    sid = meta["sid"]
+    restored = []
+    src_jsonl = os.path.join(entry, sid + ".jsonl")
+    if os.path.exists(src_jsonl):
+        shutil.move(src_jsonl, meta["original_jsonl"])
+        restored.append(meta["original_jsonl"])
+    if meta.get("had_attachments"):
+        src_att = os.path.join(entry, "attachments")
+        dest_att = os.path.join(dest, sid)
+        if os.path.exists(src_att):
+            shutil.move(src_att, dest_att)
+            restored.append(dest_att)
+    try:
+        shutil.rmtree(entry)
+    except OSError:
+        pass
+    return restored
+
+
+# ---------------- 缓存 ----------------
+def write_cache(sessions, origin_cwd, all_projects=False, project_path=None,
+                grep=None, time_range=None, sort="time"):
+    data = {
+        "index_to_id": {str(i + 1): s["sid"] for i, s in enumerate(sessions)},
+        "cwd_by_id": {s["sid"]: s["cwd"] for s in sessions},
+        "path_by_id": {s["sid"]: s.get("path", "") for s in sessions},
+        "cwd": origin_cwd,
+        "generated_at": datetime.now().astimezone().isoformat(),
+        "count": len(sessions),
+        "list_all": all_projects,
+        "list_project": project_path,
+        "list_grep": grep,
+        "list_time": time_range,
+        "list_sort": sort,
+    }
+    try:
+        os.makedirs(os.path.dirname(CACHE_FILE), exist_ok=True)
+        with open(CACHE_FILE, "w", encoding="utf-8") as f:
+            json.dump(data, f, ensure_ascii=False, indent=2)
+    except OSError:
+        pass
+
+
+def load_cache():
+    try:
+        with open(CACHE_FILE, "r", encoding="utf-8") as f:
+            return json.load(f)
+    except (OSError, json.JSONDecodeError):
+        return None
+
+
+def resolve_session(n):
+    """从缓存解析序号 N -> (sid, cwd, cache), 失败则退出"""
+    cache = load_cache()
+    if not cache:
+        print("没有缓存的会话列表。请先运行 `clses` 列出会话。", file=sys.stderr)
+        sys.exit(1)
+    mapping = cache.get("index_to_id", {})
+    key = str(n)
+    if key not in mapping:
+        print(
+            f"序号 {n} 不在最近一次列表中(范围 1..{len(mapping)})。"
+            f"请重新运行 `clses` 刷新列表。",
+            file=sys.stderr,
+        )
+        sys.exit(1)
+    sid = mapping[key]
+    cwd_by_id = cache.get("cwd_by_id", {})
+    target_cwd = cwd_by_id.get(sid) or cache.get("cwd")
+    # 优先用缓存里记录的真实路径(免疫 cwd 编码边界情况), 回退到按 cwd 推导
+    jsonl_path = (
+        cache.get("path_by_id", {}).get(sid)
+        or os.path.join(project_dir_for(target_cwd), sid + ".jsonl")
+    ) if target_cwd else ""
+    return sid, target_cwd, jsonl_path, cache
+
+
+# ---------------- 过滤/排序/输出 ----------------
+def sort_sessions(sessions, sort):
+    key = lambda s: s["last_ts"] or datetime.min.replace(tzinfo=timezone.utc)
+    if sort == "oldest":
+        sessions.sort(key=key)
+    elif sort == "size":
+        sessions.sort(key=lambda s: s.get("size", 0), reverse=True)
+    elif sort == "turns":
+        sessions.sort(key=lambda s: s.get("turns", 0), reverse=True)
+    else:  # time: 最近在前
+        sessions.sort(key=key, reverse=True)
+
+
+def filter_time(sessions, rng):
+    now_local = datetime.now().astimezone()
+    if rng == "today":
+        start = now_local.replace(hour=0, minute=0, second=0, microsecond=0)
+        return [s for s in sessions if s["last_ts"] and s["last_ts"].astimezone() >= start]
+    m = re.fullmatch(r"(\d+)([hdw])", rng)
+    if not m:
+        print(f"无法识别的时间范围: {rng}（支持 today / Nh / Nd / Nw）", file=sys.stderr)
+        sys.exit(2)
+    n = int(m.group(1))
+    unit = m.group(2)
+    if unit == "h":
+        delta = timedelta(hours=n)
+    elif unit == "d":
+        delta = timedelta(days=n)
+    else:
+        delta = timedelta(weeks=n)
+    start = now_local - delta
+    return [s for s in sessions if s["last_ts"] and s["last_ts"].astimezone() >= start]
+
+
+def filter_grep(sessions, pat):
+    p = pat.lower()
+    return [
+        s for s in sessions
+        if p in (clean_prompt(s["first_prompt"]) + " " + clean_prompt(s["last_prompt"])).lower()
+    ]
+
+
+def dump_output(sessions, output, active):
+    if output == "json":
+        data = []
+        for i, s in enumerate(sessions, 1):
+            data.append({
+                "index": i,
+                "sid": s["sid"],
+                "cwd": s["cwd"],
+                "topic": clean_prompt(s["first_prompt"]),
+                "last": clean_prompt(s["last_prompt"]),
+                "turns": s["turns"],
+                "size": s.get("size", 0),
+                "first_ts": s["first_ts"].isoformat() if s["first_ts"] else None,
+                "last_ts": s["last_ts"].isoformat() if s["last_ts"] else None,
+                "active": s["sid"] in active,
+            })
+        print(json.dumps(data, ensure_ascii=False, indent=2))
+    elif output == "csv":
+        w = csv.writer(sys.stdout)
+        w.writerow(["#", "sid", "cwd", "topic", "last", "turns", "size", "last_time", "active"])
+        for i, s in enumerate(sessions, 1):
+            w.writerow([
+                i, s["sid"], s["cwd"], clean_prompt(s["first_prompt"]),
+                clean_prompt(s["last_prompt"]), s["turns"], s.get("size", 0),
+                format_time(s["last_ts"]), s["sid"] in active,
+            ])
+
+
+# ---------------- 列表模式 ----------------
+def list_mode(full=False, all_projects=False, project_path=None,
+              grep=None, time_range=None, sort="time", output="table"):
+    cwd = os.getcwd()
+    if project_path:
+        target_cwd = os.path.abspath(os.path.expanduser(project_path))
+        files = list_project_sessions(project_dir_for(target_cwd))
+        origin_cwd = target_cwd
+        title = f"项目 {target_cwd} 的会话"
+    elif all_projects:
+        files = list_all_sessions()
+        origin_cwd = cwd
+        title = "所有项目会话"
+    else:
+        files = list_project_sessions(project_dir_for(cwd))
+        origin_cwd = cwd
+        title = f"当前项目 {cwd} 的会话"
+
+    sessions = [s for s in (parse_session(p) for p in files) if s]
+
+    if time_range:
+        sessions = filter_time(sessions, time_range)
+    if grep:
+        sessions = filter_grep(sessions, grep)
+    sort_sessions(sessions, sort)
+
+    if not sessions:
+        print(f"{title}：没有匹配的会话记录。")
+        print(f"(会话目录: {project_dir_for(origin_cwd) if not all_projects else PROJECTS_DIR + '/*'})")
+        return
+
+    write_cache(sessions, origin_cwd, all_projects=all_projects, project_path=project_path,
+                grep=grep, time_range=time_range, sort=sort)
+    active = active_session_ids()
+
+    if output in ("json", "csv"):
+        dump_output(sessions, output, active)
+        return
+
+    tw, lw = compute_widths(all_projects, full)
+    rows = []
+    colors = [["1"] * (7 if all_projects else 6)]  # 表头: 粗体
+    for i, s in enumerate(sessions, 1):
+        is_active = s["sid"] in active
+        topic = clean_prompt(s["first_prompt"]) or ("(空会话)" if not s["last_prompt"] else "—")
+        last = clean_prompt(s["last_prompt"])
+        topic = ellipsize(topic, tw)
+        last = ellipsize(last, lw)
+        idx = f"{i}*" if is_active else str(i)
+        row = [idx, s["sid"], topic, last, str(s["turns"]), format_time(s["last_ts"])]
+        rc = ["31" if is_active else "2", "2", None, "36", "2", "2"]
+        if all_projects:
+            row.insert(2, ellipsize(short_project(s["cwd"]), PROJ_W))
+            rc.insert(2, "2")
+        rows.append(row)
+        colors.append(rc)
+
+    if all_projects:
+        headers = ["#", "Session ID", "项目", "主题", "最后对话", "轮次", "最后活动"]
+        aligns = ["r", "l", "l", "l", "l", "r", "r"]
+        widths = [3, SID_W, PROJ_W, tw, lw, 4, 11]
+    else:
+        headers = ["#", "Session ID", "主题", "最后对话", "轮次", "最后活动"]
+        aligns = ["r", "l", "l", "l", "r", "r"]
+        widths = [3, SID_W, tw, lw, 4, 11]
+
+    print(f"{title}（共 {len(sessions)} 个，{sort} 排序）:")
+    print()
+    print(render_table(headers, aligns, widths, rows, colors))
+    print()
+    n_active = len(active & {s["sid"] for s in sessions})
+    print("恢复 clses <序号> · 全文 clses -x <序号> · 删除 clses -d <序号>")
+    if n_active:
+        print(f"(* 表示正在运行, 共 {n_active} 个)")
+
+
+# ---------------- 动作模式 ----------------
+def resume_mode(n):
+    sid, target_cwd, _, _ = resolve_session(n)
+    claude = shutil.which("claude") or "claude"
+    print(f"→ 恢复会话 #{n}: {sid}")
+    if target_cwd:
+        try:
+            os.chdir(target_cwd)
+            print(f"  (在 {target_cwd} 下恢复)")
+        except OSError:
+            pass
+    os.execvp(claude, ["claude", "--resume", sid])
+
+
+def view_mode(n):
+    sid, target_cwd, jsonl, _ = resolve_session(n)
+    if not jsonl or not os.path.exists(jsonl):
+        print(f"会话文件不存在: {jsonl}", file=sys.stderr)
+        sys.exit(1)
+    info = parse_session(jsonl)
+    if info:
+        print(c("1", f"会话 {sid}"))
+        if info["cwd"]:
+            print(f"  项目: {info['cwd']}")
+        print(f"  主题: {clean_prompt(info['first_prompt']) or '(空会话)'}")
+        print(f"  轮次: {info['turns']}  大小: {info['size']} 字节  最后活动: {format_time(info['last_ts'])}")
+        if sid in active_session_ids():
+            print("  状态: 正在运行")
+    print()
+    print(c("2", "=" * 70))
+    shown = 0
+    with open(jsonl, "r", encoding="utf-8", errors="replace") as f:
+        for line in f:
+            line = line.strip()
+            if not line:
+                continue
+            try:
+                d = json.loads(line)
+            except json.JSONDecodeError:
+                continue
+            t = d.get("type")
+            ts = format_time(parse_dt(d.get("timestamp", "").replace("Z", "+00:00")) if d.get("timestamp") else None)
+            if t == "user" and not is_meta_or_command(d) and not is_tool_result_only(d):
+                txt = extract_text(d["message"]["content"]).strip()
+                if txt:
+                    print(c("32", f"[用户] {ts}"))
+                    for ln in txt.splitlines():
+                        print(f"  {ln}")
+                    shown += 1
+            elif t == "assistant" and not d.get("isApiErrorMessage"):
+                content = d.get("message", {}).get("content", [])
+                texts, tools = [], []
+                if isinstance(content, list):
+                    for b in content:
+                        if not isinstance(b, dict):
+                            continue
+                        if b.get("type") == "text":
+                            tx = b.get("text", "").strip()
+                            if tx:
+                                texts.append(tx)
+                        elif b.get("type") == "tool_use":
+                            tools.append(b.get("name", "?"))
+                if texts or tools:
+                    print(c("33", f"[助手] {ts}"))
+                    for tx in texts:
+                        for ln in tx.splitlines():
+                            print(f"  {ln}")
+                    if tools:
+                        print(c("35", "  ⚙ 调用: " + ", ".join(tools)))
+                    shown += 1
+    print(c("2", "=" * 70))
+    print(f"(共 {shown} 条对话)")
+
+
+def delete_mode(n, assume_yes=False):
+    sid, target_cwd, jsonl, cache = resolve_session(n)
+    if not jsonl:
+        print(f"找不到会话 {sid} 的文件路径，无法删除。", file=sys.stderr)
+        sys.exit(1)
+
+    sibdir = os.path.join(os.path.dirname(jsonl), sid)
+
+    # 安全校验: 目标必须在 PROJECTS_DIR 之下
+    root = os.path.realpath(PROJECTS_DIR)
+    for p in (jsonl, sibdir):
+        rp = os.path.realpath(p)
+        if not (rp.startswith(root + os.sep) or rp == root):
+            print(f"安全校验失败: {p} 不在 {PROJECTS_DIR} 下，拒绝删除。", file=sys.stderr)
+            sys.exit(1)
+
+    if not os.path.exists(jsonl) and not os.path.isdir(sibdir):
+        print(f"会话文件不存在(可能已删): {jsonl}", file=sys.stderr)
+        sys.exit(1)
+
+    if sid in active_session_ids():
+        print(f"会话 {sid} 正在运行，不能删除。请先退出该会话再删。", file=sys.stderr)
+        sys.exit(1)
+
+    info = parse_session(jsonl) if os.path.exists(jsonl) else None
+    print("将删除(移入回收站, 可 --restore 恢复):")
+    print(f"  会话 ID : {sid}")
+    print(f"  项目    : {target_cwd}")
+    if info:
+        print(f"  主题    : {ellipsize(clean_prompt(info['first_prompt']), 60)}")
+        print(f"  最后对话: {ellipsize(clean_prompt(info['last_prompt']), 60)}")
+        print(f"  轮次    : {info['turns']}")
+    print(f"  文件    : {jsonl}")
+    if os.path.isdir(sibdir):
+        print(f"  附件目录: {sibdir}/")
+    print(f"  大小    : {dir_size(jsonl) + dir_size(sibdir)} 字节")
+
+    if not assume_yes:
+        try:
+            ans = input("确认删除? 输入 y 确认, 其他取消: ")
+        except (EOFError, KeyboardInterrupt):
+            print("\n已取消。")
+            return
+        if ans.strip().lower() not in ("y", "yes"):
+            print("已取消。")
+            return
+
+    moved, meta, entry = move_to_trash(sid, target_cwd, jsonl, sibdir)
+    if moved:
+        print(f"已移入回收站: {entry}")
+        print(f"恢复: clses --restore <序号>  (先 clses --trash 查看)")
+        list_mode(
+            full=False,
+            all_projects=cache.get("list_all", False),
+            project_path=cache.get("list_project"),
+            grep=cache.get("list_grep"),
+            time_range=cache.get("list_time"),
+            sort=cache.get("list_sort", "time"),
+            output="table",
+        )
+    else:
+        print("没有文件被删除。", file=sys.stderr)
+
+
+def restore_mode(n):
+    entries = list_trash()
+    if not entries:
+        print("回收站为空。")
+        return
+    if n < 1 or n > len(entries):
+        print(f"序号 {n} 超出回收站范围(1..{len(entries)})，以下是回收站内容:", file=sys.stderr)
+        print()
+        trash_mode()
+        return
+    entry, meta = entries[n - 1]
+    print(f"恢复会话 {meta['sid']}（原项目 {meta.get('cwd', '?')}）")
+    restored = restore_from_trash(entry)
+    if restored:
+        print("已恢复: " + ", ".join(restored))
+    else:
+        print("没有可恢复的文件。", file=sys.stderr)
+
+
+def trash_mode():
+    entries = list_trash()
+    if not entries:
+        print("回收站为空。")
+        return
+    rows = []
+    for i, (entry, meta) in enumerate(entries, 1):
+        info = None
+        jsonl = os.path.join(entry, meta["sid"] + ".jsonl")
+        if os.path.exists(jsonl):
+            info = parse_session(jsonl)
+        topic = clean_prompt(info["first_prompt"]) if info else ""
+        rows.append([
+            str(i), meta["sid"],
+            ellipsize(topic, 40),
+            format_time(parse_dt(meta.get("trash_time"))),
+            str(dir_size(entry)),
+        ])
+    headers = ["#", "Session ID", "主题", "删除时间", "大小(字节)"]
+    aligns = ["r", "l", "l", "r", "r"]
+    widths = [3, SID_W, 40, 17, 12]
+    print(f"回收站中的会话（共 {len(entries)} 个，最近删除在前）:")
+    print()
+    print(render_table(headers, aligns, widths, rows))
+    print()
+    print("恢复: clses --restore <序号>")
+
+
+# ---------------- 帮助/参数解析 ----------------
+def print_help():
+    print(__doc__.strip())
+
+
+def _need_value(a, args, i):
+    if i + 1 >= len(args):
+        print(f"{a} 需要一个参数", file=sys.stderr)
+        return None
+    return args[i + 1]
+
+
+def _positive_int(v, what):
+    if not v.isdigit() or int(v) <= 0:
+        print(f"{what}序号须为正整数: {v}", file=sys.stderr)
+        return None
+    return int(v)
+
+
+def main(argv):
+    args = argv[1:]
+
+    full = False
+    all_projects = False
+    project_path = None
+    grep = None
+    time_range = None
+    sort = "time"
+    output = "table"
+    delete_n = None
+    view_n = None
+    restore_n = None
+    list_trash_flag = False
+    assume_yes = False
+    positional = []
+    i = 0
+    while i < len(args):
+        a = args[i]
+        if a in ("-h", "--help"):
+            print_help()
+            return 0
+        elif a in ("-a", "--all"):
+            all_projects = True
+        elif a in ("-f", "--full"):
+            full = True
+        elif a in ("-y", "--yes"):
+            assume_yes = True
+        elif a in ("--json",):
+            output = "json"
+        elif a in ("--csv",):
+            output = "csv"
+        elif a == "--trash":
+            list_trash_flag = True
+        elif a in ("-p", "--project"):
+            v = _need_value(a, args, i)
+            if v is None:
+                return 2
+            project_path = v
+            i += 1
+        elif a in ("-d", "--delete"):
+            v = _need_value(a, args, i)
+            if v is None:
+                return 2
+            delete_n = _positive_int(v, "删除")
+            if delete_n is None:
+                return 2
+            i += 1
+        elif a in ("-x", "--view"):
+            v = _need_value(a, args, i)
+            if v is None:
+                return 2
+            view_n = _positive_int(v, "查看")
+            if view_n is None:
+                return 2
+            i += 1
+        elif a == "--restore":
+            if i + 1 < len(args) and args[i + 1].isdigit() and int(args[i + 1]) > 0:
+                restore_n = int(args[i + 1])
+                i += 1
+            else:
+                # 没给序号 → 列出回收站, 让用户先看清楚该恢复哪个
+                list_trash_flag = True
+        elif a in ("-g", "--grep"):
+            v = _need_value(a, args, i)
+            if v is None:
+                return 2
+            grep = v
+            i += 1
+        elif a in ("-t", "--time"):
+            v = _need_value(a, args, i)
+            if v is None:
+                return 2
+            time_range = v
+            i += 1
+        elif a == "--sort":
+            v = _need_value(a, args, i)
+            if v is None:
+                return 2
+            sort = v
+            i += 1
+        elif a.startswith("--") or (a.startswith("-") and len(a) > 1 and not a.lstrip("-").isdigit()):
+            print(f"未知选项: {a}", file=sys.stderr)
+            return 2
+        else:
+            positional.append(a)
+        i += 1
+
+    if sort not in ("time", "oldest", "size", "turns"):
+        print(f"无法识别的排序键: {sort}（time/oldest/size/turns）", file=sys.stderr)
+        return 2
+
+    # 裸位置参数 = 恢复序号
+    resume_n = None
+    for p in positional:
+        if p.isdigit() and int(p) > 0:
+            if resume_n is not None:
+                print(f"只能给一个序号: {positional}", file=sys.stderr)
+                return 2
+            resume_n = int(p)
+        else:
+            print(f"无法识别的参数: {p}", file=sys.stderr)
+            return 2
+
+    # 模式判定: 最多一个动作
+    action_count = sum(1 for x in (resume_n, delete_n, view_n, restore_n) if x is not None)
+    if list_trash_flag:
+        action_count += 1
+    if action_count > 1:
+        print("只能使用一个动作(恢复/查看/删除/恢复删除/回收站)。", file=sys.stderr)
+        return 2
+
+    listing_opts = (
+        all_projects or project_path or full or grep is not None
+        or time_range is not None or sort != "time" or output != "table"
+    )
+    if action_count >= 1 and listing_opts:
+        print("动作模式不能与列表选项(-a/-p/-f/-g/-t/--sort/--json/--csv)同时使用。", file=sys.stderr)
+        return 2
+
+    if resume_n is not None:
+        resume_mode(resume_n)
+        return 0
+    if delete_n is not None:
+        delete_mode(delete_n, assume_yes=assume_yes)
+        return 0
+    if view_n is not None:
+        view_mode(view_n)
+        return 0
+    if restore_n is not None:
+        restore_mode(restore_n)
+        return 0
+    if list_trash_flag:
+        trash_mode()
+        return 0
+
+    list_mode(full=full, all_projects=all_projects, project_path=project_path,
+              grep=grep, time_range=time_range, sort=sort, output=output)
+    return 0
+
+
+if __name__ == "__main__":
+    try:
+        sys.exit(main(sys.argv))
+    except KeyboardInterrupt:
+        print("\n已中断。")
+        sys.exit(130)

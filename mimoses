@@ -1,0 +1,1028 @@
+#!/usr/bin/env python3
+# -*- coding: utf-8 -*-
+"""mimoses — 列出/查看/恢复/删除 mimocode 会话。
+
+用法:
+  mimoses                          列出当前目录的会话
+  mimoses N                        恢复第 N 个会话 (mimo -s <id>)
+  mimoses -x N, --view N           展开第 N 个会话的全文对话
+  mimoses -d N, --delete N         删除第 N 个会话(移入回收站; -y 跳过确认)
+  mimoses --restore [N]            恢复第 N 个; 省略 N 则列出回收站
+  mimoses --trash                  列出回收站
+  mimoses -a, --all                列出所有项目会话
+  mimoses -p PATH, --project PATH  列出指定目录的会话
+  mimoses -f, --full               加宽"主题/最后对话"列
+  mimoses -g PAT, --grep PAT       按关键词过滤(全文搜索 history_fts)
+  mimoses -t RANGE, --time RANGE   按时间过滤: today / 1h / 7d / 30d / 2w
+  mimoses --sort KEY               排序: time(默认) / oldest / size / turns
+  mimoses --json / --csv           以 JSON/CSV 输出
+  mimoses -y, --yes                删除时跳过确认
+  mimoses -h, --help               帮助
+
+说明:
+  - 序号(N)对应"最近一次列表"的结果; 过滤/排序/项目范围都会重排编号。
+  - 数据源: ~/.local/share/mimocode/mimocode.db (SQLite, 只读打开)
+  - 主题 = session.title (mimo 首条提问自动生成)
+  - 最后对话 = history_fts kind='user_text' 最后一条 body
+  - 轮次 = message 表中 role='assistant' 条数
+  - 大小 = SUM(length(message.data)) / 1024 (KB)
+  - 颜色仅当输出到终端(tty)时启用, 管道自动关闭。
+  - 删除是"移入回收站"而非直删: 先 mimo export 到 ~/.mimoses-trash/
+    再 mimo session delete, 可 --restore 恢复(用 mimo import 重建)。
+  - 活跃判定: locks 目录 / actor_registry 表 / pgrep -f mimo 三选一。
+依赖: 仅 Python 标准库。
+"""
+import sys
+import os
+import re
+import json
+import glob
+import shutil
+import csv
+import sqlite3
+import subprocess
+import unicodedata
+import argparse
+from datetime import datetime, timezone
+
+# ---------------- 常量 ----------------
+DB_PATH = os.path.expanduser("~/.local/share/mimocode/mimocode.db")
+LOCK_DIR = os.path.expanduser("~/.local/state/mimocode/locks")
+TRASH_DIR = os.path.expanduser("~/.mimoses-trash")
+CACHE_FILE = os.path.expanduser("~/.mimoses-cache.json")
+MIMO_BIN = os.path.expanduser("~/.mimocode/bin/mimo")
+
+# 文本列宽度区间(显示宽度, CJK算2): 最小 / 默认上限 / --full上限
+TOPIC_MIN, TOPIC_MAX, TOPIC_MAX_FULL = 8, 52, 100
+LAST_MIN, LAST_MAX, LAST_MAX_FULL = 12, 120, 240
+PROJ_W = 14
+SID_W = 36
+TERM_FALLBACK = 120
+VIEW_TRUNC = 200
+
+_COLOR = sys.stdout.isatty()
+
+
+# ---------------- CJK 宽度感知工具 ----------------
+def wcw(c):
+    return 2 if unicodedata.east_asian_width(c) in ("W", "F") else 1
+
+
+def swidth(s):
+    return sum(wcw(c) for c in s)
+
+
+def ellipsize(s, width):
+    if width <= 0:
+        return ""
+    if swidth(s) <= width:
+        return s
+    out = []
+    w = 0
+    for c in s:
+        cw = wcw(c)
+        if w + cw > width - 1:
+            break
+        out.append(c)
+        w += cw
+    out.append("…")
+    return "".join(out)
+
+
+def ljust(s, width):
+    s = ellipsize(s, width)
+    return s + " " * (width - swidth(s))
+
+
+def rjust(s, width):
+    s = ellipsize(s, width)
+    return " " * (width - swidth(s)) + s
+
+
+def clean_prompt(s):
+    return " ".join(s.split())
+
+
+# ---------------- 颜色 ----------------
+def c(code, s):
+    if _COLOR:
+        return f"\033[{code}m{s}\033[0m"
+    return s
+
+
+# ---------------- 数据库 ----------------
+def connect_ro():
+    return sqlite3.connect("file:" + DB_PATH + "?mode=ro", uri=True)
+
+
+def fetch_session_rows(cwd=None, all_projects=False, project_path=None):
+    """拉取 (id, directory, title, time_created, time_updated) 的会话行"""
+    con = connect_ro()
+    try:
+        if not os.path.exists(DB_PATH):
+            print(f"数据库不存在: {DB_PATH}", file=sys.stderr)
+            sys.exit(1)
+        cur = con.cursor()
+        q = ("SELECT id, directory, title, time_created, time_updated "
+             "FROM session WHERE time_archived IS NULL")
+        params = []
+        if project_path:
+            q += " AND directory = ?"
+            params.append(os.path.abspath(os.path.expanduser(project_path)))
+        elif not all_projects:
+            q += " AND directory = ?"
+            params.append(os.getcwd())
+        cur.execute(q, params)
+        return cur.fetchall()
+    finally:
+        con.close()
+
+
+def count_turns(con, sid):
+    cur = con.execute(
+        "SELECT COUNT(*) FROM message WHERE session_id=? "
+        "AND json_extract(data, '$.role')='assistant'",
+        (sid,))
+    return cur.fetchone()[0] or 0
+
+
+def get_last_user_prompt(con, sid):
+    cur = con.execute(
+        "SELECT body FROM history_fts WHERE session_id=? AND kind='user_text' "
+        "ORDER BY time_created DESC, rowid DESC LIMIT 1",
+        (sid,))
+    r = cur.fetchone()
+    return r[0] if r else ""
+
+
+def estimate_size(con, sid):
+    cur = con.execute(
+        "SELECT COALESCE(SUM(length(data)),0) FROM message WHERE session_id=?",
+        (sid,))
+    return cur.fetchone()[0] or 0
+
+
+def load_sessions(cwd=None, all_projects=False, project_path=None,
+                  grep=None, time_range=None, sort="time"):
+    """加载会话列表, 应用过滤/排序, 返回 dict 列表"""
+    base_rows = fetch_session_rows(cwd=cwd, all_projects=all_projects,
+                                   project_path=project_path)
+    if not base_rows:
+        return []
+
+    con = connect_ro()
+    try:
+        results = []
+        for sid, dir_, title, tc, tu in base_rows:
+            last = get_last_user_prompt(con, sid)
+            turns = count_turns(con, sid)
+            size_bytes = estimate_size(con, sid)
+            results.append({
+                "id": sid,
+                "directory": dir_ or "",
+                "title": title or "",
+                "time_created": tc or 0,
+                "time_updated": tu or 0,
+                "turns": turns,
+                "size_bytes": size_bytes,
+                "size_kb": round(size_bytes / 1024.0, 1),
+                "last_prompt": last,
+            })
+    finally:
+        con.close()
+
+    if grep:
+        results = filter_grep(results, grep)
+    if time_range:
+        results = filter_time(results, time_range)
+    sort_sessions(results, sort)
+    return results
+
+
+# ---------------- 时间 ----------------
+def ms_to_dt(ms):
+    if not ms:
+        return None
+    return datetime.fromtimestamp(ms / 1000.0, tz=timezone.utc)
+
+
+def format_time(ms):
+    dt = ms_to_dt(ms)
+    if dt is None:
+        return ""
+    local = dt.astimezone()
+    now = datetime.now().astimezone()
+    if local.year == now.year:
+        return local.strftime("%m-%d %H:%M")
+    return local.strftime("%Y-%m-%d")
+
+
+def short_project(cwd):
+    if not cwd:
+        return "?"
+    parts = cwd.rstrip("/").split("/")
+    tail = "/".join(parts[-2:]) if len(parts) >= 2 else (parts[-1] if parts else "?")
+    return tail or "?"
+
+
+def parse_time_range(rng):
+    """解析 today / Nh / Nd / Nw, 返回阈值 ms"""
+    now = datetime.now().astimezone()
+    if rng == "today":
+        start = now.replace(hour=0, minute=0, second=0, microsecond=0)
+        return start.timestamp() * 1000
+    m = re.fullmatch(r"(\d+)([hdw])", rng)
+    if not m:
+        print(f"无法识别的时间范围: {rng}（支持 today / Nh / Nd / Nw）", file=sys.stderr)
+        sys.exit(2)
+    n = int(m.group(1))
+    unit = m.group(2)
+    if unit == "h":
+        delta_s = n * 3600
+    elif unit == "d":
+        delta_s = n * 86400
+    else:
+        delta_s = n * 604800
+    return (now.timestamp() - delta_s) * 1000
+
+
+# ---------------- 过滤/排序/输出 ----------------
+def sort_sessions(sessions, sort):
+    if sort == "oldest":
+        sessions.sort(key=lambda s: s["time_created"] or 0)
+    elif sort == "size":
+        sessions.sort(key=lambda s: s.get("size_bytes", 0), reverse=True)
+    elif sort == "turns":
+        sessions.sort(key=lambda s: s.get("turns", 0), reverse=True)
+    else:
+        sessions.sort(key=lambda s: s["time_updated"] or 0, reverse=True)
+
+
+def filter_time(sessions, rng):
+    thr = parse_time_range(rng)
+    return [s for s in sessions if (s["time_updated"] or 0) >= thr]
+
+
+def filter_grep(sessions, pat):
+    """FTS5 全文匹配 history_fts, 失败则回退到 title/last_prompt 子串匹配"""
+    try:
+        con = connect_ro()
+        try:
+            safe_pat = pat.replace('"', '""')
+            cur = con.execute(
+                "SELECT DISTINCT session_id FROM history_fts WHERE body MATCH ?",
+                (safe_pat,))
+            fts_ids = {r[0] for r in cur.fetchall()}
+        finally:
+            con.close()
+    except sqlite3.Error:
+        fts_ids = set()
+
+    p = pat.lower()
+    return [
+        s for s in sessions
+        if s["id"] in fts_ids
+        or p in (s["title"] + " " + s["last_prompt"]).lower()
+    ]
+
+
+def emit_json(sessions, active):
+    data = []
+    for i, s in enumerate(sessions, 1):
+        data.append({
+            "index": i,
+            "sid": s["id"],
+            "directory": s["directory"],
+            "topic": clean_prompt(s["title"]),
+            "last": clean_prompt(s["last_prompt"]),
+            "turns": s["turns"],
+            "size_kb": s["size_kb"],
+            "first_ts": s["time_created"],
+            "last_ts": s["time_updated"],
+            "active": s["id"] in active,
+        })
+    print(json.dumps(data, ensure_ascii=False, indent=2))
+
+
+def emit_csv(sessions, active):
+    w = csv.writer(sys.stdout)
+    w.writerow(["#", "sid", "directory", "topic", "last", "turns",
+                 "size_kb", "last_time", "active"])
+    for i, s in enumerate(sessions, 1):
+        topic = clean_prompt(s["title"])[:200]
+        last = clean_prompt(s["last_prompt"])[:300]
+        w.writerow([
+            i, s["id"], s["directory"], topic,
+            last, s["turns"], s["size_kb"],
+            format_time(s["time_updated"]), s["id"] in active,
+        ])
+
+
+# ---------------- 表格渲染 ----------------
+def render_table(headers, aligns, widths, rows, colors=None):
+    n = len(headers)
+    cw = [widths[i] for i in range(n)]
+
+    def fmt(val, i, j):
+        s = str(val)
+        w = cw[i]
+        padded = rjust(s, w) if aligns[i] == "r" else ljust(s, w)
+        if colors and j < len(colors) and i < len(colors[j]):
+            code = colors[j][i]
+            if code:
+                return c(code, padded)
+        return padded
+
+    def border(left, mid, right):
+        return left + mid.join("─" * (cw[i] + 2) for i in range(n)) + right
+
+    lines = [border("┌", "┬", "┐")]
+    lines.append("│ " + " │ ".join(fmt(headers[i], i, 0) for i in range(n)) + " │")
+    lines.append(border("├", "┼", "┤"))
+    for j, r in enumerate(rows, 1):
+        lines.append("│ " + " │ ".join(fmt(r[i], i, j) for i in range(n)) + " │")
+    lines.append(border("└", "┴", "┘"))
+    return "\n".join(lines)
+
+
+def compute_widths(all_projects, full):
+    term = shutil.get_terminal_size((TERM_FALLBACK, 40)).columns
+    n = 7 if all_projects else 6
+    overhead = 4 + 3 * (n - 1)
+    fixed = 3 + SID_W + 4 + 11
+    if all_projects:
+        fixed += PROJ_W
+    available = term - overhead - fixed
+
+    topic_max = TOPIC_MAX_FULL if full else TOPIC_MAX
+    last_max = LAST_MAX_FULL if full else LAST_MAX
+    topic_w = min(topic_max, max(TOPIC_MIN, available // 3))
+    last_w = min(last_max, max(LAST_MIN, available - topic_w))
+    return topic_w, last_w
+
+
+# ---------------- 活跃会话判定 ----------------
+def _pid_alive(pid):
+    if not pid:
+        return False
+    try:
+        os.kill(pid, 0)
+        return True
+    except ProcessLookupError:
+        return False
+    except PermissionError:
+        return True
+    except OSError:
+        return False
+
+
+def active_session_ids():
+    """正在运行的会话 ID 集合(锁目录 / actor_registry / ps 扫描三选一)
+
+    锁目录结构: ~/.local/state/mimocode/locks/<hash>.lock/{meta.json,heartbeat}
+    meta.json 含 {token, pid, hostname, createdAt}, 无 session_id 字段。
+    锁名是 project/session 的哈希, 无法反推 session_id。
+    因此锁只作为"有 mimo 进程在跑"的旁证; 具体哪个会话活跃靠 ps 扫描 + 时间启发。
+    """
+    ids = set()
+    any_lock_alive = False
+
+    # 1. locks 目录(目录型锁, 读每个子目录的 meta.json)
+    if os.path.isdir(LOCK_DIR):
+        try:
+            for name in os.listdir(LOCK_DIR):
+                lock_dir = os.path.join(LOCK_DIR, name)
+                if not os.path.isdir(lock_dir):
+                    continue
+                meta_path = os.path.join(lock_dir, "meta.json")
+                if not os.path.exists(meta_path):
+                    continue
+                try:
+                    with open(meta_path, "r") as fh:
+                        meta = json.load(fh)
+                    pid = meta.get("pid")
+                    if pid and _pid_alive(pid):
+                        any_lock_alive = True
+                except (OSError, json.JSONDecodeError):
+                    continue
+        except OSError:
+            pass
+
+    # 2. actor_registry 表(子代理/持久代理的 running 状态)
+    try:
+        con = connect_ro()
+        try:
+            cur = con.execute(
+                "SELECT DISTINCT session_id FROM actor_registry "
+                "WHERE status IN ('running','active','busy')")
+            for r in cur.fetchall():
+                if r[0]:
+                    ids.add(r[0])
+        except sqlite3.Error:
+            pass
+        finally:
+            con.close()
+    except sqlite3.Error:
+        pass
+
+    # 3. ps 扫描(比 pgrep -af 更可靠, macOS 兼容)
+    try:
+        out = subprocess.check_output(
+            ["ps", "-eo", "pid=,args="],
+            text=True, timeout=3, stderr=subprocess.DEVNULL)
+        for line in out.splitlines():
+            if "mimoses" in line:
+                continue
+            for cand in re.findall(r"ses_[A-Za-z0-9]+", line):
+                ids.add(cand)
+    except (subprocess.SubprocessError, OSError):
+        pass
+
+    # 4. 时间启发: 若有锁且 PID 存活, 把最近 60s 内更新的会话标为活跃
+    #    (无法反推锁→会话映射时的保守策略)
+    if any_lock_alive and not ids:
+        try:
+            now_ms = int(datetime.now().timestamp() * 1000)
+            thr = now_ms - 60000
+            con = connect_ro()
+            try:
+                cur = con.execute(
+                    "SELECT id FROM session WHERE time_updated >= ? "
+                    "AND time_archived IS NULL", (thr,))
+                for r in cur.fetchall():
+                    ids.add(r[0])
+            finally:
+                con.close()
+        except sqlite3.Error:
+            pass
+
+    return ids
+
+
+# ---------------- 缓存 ----------------
+def write_cache(sessions, origin_cwd, all_projects=False, project_path=None,
+                grep=None, time_range=None, sort="time"):
+    data = {
+        "list": [{
+            "id": s["id"],
+            "directory": s["directory"],
+            "title": s["title"],
+        } for s in sessions],
+        "index_to_id": {str(i + 1): s["id"] for i, s in enumerate(sessions)},
+        "cwd_by_id": {s["id"]: s["directory"] for s in sessions},
+        "cwd": origin_cwd,
+        "generated_at": datetime.now().astimezone().isoformat(),
+        "count": len(sessions),
+        "list_all": all_projects,
+        "list_project": project_path,
+        "list_grep": grep,
+        "list_time": time_range,
+        "list_sort": sort,
+    }
+    try:
+        with open(CACHE_FILE, "w", encoding="utf-8") as f:
+            json.dump(data, f, ensure_ascii=False, indent=2)
+    except OSError:
+        pass
+
+
+def load_cache():
+    try:
+        with open(CACHE_FILE, "r", encoding="utf-8") as f:
+            return json.load(f)
+    except (OSError, json.JSONDecodeError):
+        return None
+
+
+def resolve_session(n):
+    """从缓存解析序号 N -> (sid, cwd, cache), 失败则退出"""
+    cache = load_cache()
+    if not cache:
+        print("没有缓存的会话列表。请先运行 `mimoses` 列出会话。", file=sys.stderr)
+        sys.exit(1)
+    mapping = cache.get("index_to_id", {})
+    key = str(n)
+    if key not in mapping:
+        print(f"序号 {n} 不在最近一次列表中(范围 1..{len(mapping)})。"
+              f"请重新运行 `mimoses` 刷新列表。", file=sys.stderr)
+        sys.exit(1)
+    sid = mapping[key]
+    cwd_by_id = cache.get("cwd_by_id", {})
+    target_cwd = cwd_by_id.get(sid) or cache.get("cwd")
+    return sid, target_cwd, cache
+
+
+# ---------------- 回收站 ----------------
+def list_trash():
+    """列出回收站条目, 返回 [(entry_dir, meta), ...], 最新删除在前"""
+    entries = []
+    if not os.path.isdir(TRASH_DIR):
+        return entries
+    for name in sorted(os.listdir(TRASH_DIR)):
+        d = os.path.join(TRASH_DIR, name)
+        meta_path = os.path.join(d, "meta.json")
+        if os.path.isdir(d) and os.path.exists(meta_path):
+            try:
+                with open(meta_path, "r", encoding="utf-8") as fh:
+                    meta = json.load(fh)
+                entries.append((d, meta))
+            except (OSError, json.JSONDecodeError):
+                continue
+    entries.reverse()
+    return entries
+
+
+def dir_size(path):
+    total = 0
+    if os.path.isfile(path):
+        try:
+            total += os.path.getsize(path)
+        except OSError:
+            pass
+    elif os.path.isdir(path):
+        for root, _, fs in os.walk(path):
+            for fn in fs:
+                try:
+                    total += os.path.getsize(os.path.join(root, fn))
+                except OSError:
+                    pass
+    return total
+
+
+def _run_mimo(args, check=True):
+    """执行 mimo 子命令, 返回 (stdout, stderr, code)"""
+    try:
+        r = subprocess.run([MIMO_BIN] + args,
+                           capture_output=True, text=True, timeout=120)
+        return r.stdout, r.stderr, r.returncode
+    except subprocess.SubprocessError as e:
+        return "", str(e), 1
+    except OSError as e:
+        return "", str(e), 1
+
+
+def move_to_trash(sid, directory, title):
+    """export → 存到 trash → session delete, 返回 entry_dir"""
+    epoch = int(datetime.now().timestamp())
+    entry = os.path.join(TRASH_DIR, f"{epoch}_{sid}")
+    os.makedirs(entry, exist_ok=True)
+
+    session_json = os.path.join(entry, "session.json")
+
+    # 先导出到 session.json (mimo export 无 --output, 输出到 stdout)
+    stdout, stderr, code = _run_mimo(["export", sid])
+    if code != 0 or not stdout.strip():
+        print(f"mimo export 失败(code={code}): {stderr.strip()[:300]}", file=sys.stderr)
+        try:
+            shutil.rmtree(entry)
+        except OSError:
+            pass
+        sys.exit(1)
+
+    try:
+        with open(session_json, "w", encoding="utf-8") as f:
+            f.write(stdout)
+    except OSError as e:
+        print(f"写入回收站失败: {e}", file=sys.stderr)
+        try:
+            shutil.rmtree(entry)
+        except OSError:
+            pass
+        sys.exit(1)
+
+    meta = {
+        "sid": sid,
+        "directory": directory,
+        "title": title,
+        "export_path": session_json,
+        "trash_time": datetime.now().astimezone().isoformat(),
+        "trash_epoch": epoch,
+    }
+    try:
+        with open(os.path.join(entry, "meta.json"), "w", encoding="utf-8") as f:
+            json.dump(meta, f, ensure_ascii=False, indent=2)
+    except OSError as e:
+        print(f"写入 meta.json 失败: {e}", file=sys.stderr)
+        sys.exit(1)
+
+    # 硬删 (mimo session delete)
+    stdout2, stderr2, code2 = _run_mimo(["session", "delete", sid])
+    if code2 != 0:
+        print(f"mimo session delete 失败(code={code2}): {stderr2.strip()[:300]}",
+              file=sys.stderr)
+        sys.exit(1)
+
+    return entry
+
+
+def restore_from_trash(entry, meta):
+    """mimo import 回会话"""
+    session_json = meta.get("export_path") or os.path.join(entry, "session.json")
+    if not os.path.exists(session_json):
+        print(f"导出文件不存在: {session_json}", file=sys.stderr)
+        return False
+    stdout, stderr, code = _run_mimo(["import", session_json])
+    if code != 0:
+        print(f"mimo import 失败(code={code}): {stderr.strip()[:300]}", file=sys.stderr)
+        return False
+    try:
+        shutil.rmtree(entry)
+    except OSError:
+        pass
+    return True
+
+
+# ---------------- 列表模式 ----------------
+def list_mode(full=False, all_projects=False, project_path=None,
+              grep=None, time_range=None, sort="time", output="table"):
+    cwd = os.getcwd()
+    if project_path:
+        origin_cwd = os.path.abspath(os.path.expanduser(project_path))
+        title = f"项目 {origin_cwd} 的会话"
+    elif all_projects:
+        origin_cwd = cwd
+        title = "所有项目会话"
+    else:
+        origin_cwd = cwd
+        title = f"当前目录 {cwd} 的会话"
+
+    sessions = load_sessions(
+        cwd=cwd,
+        all_projects=all_projects,
+        project_path=project_path,
+        grep=grep,
+        time_range=time_range,
+        sort=sort,
+    )
+
+    if not sessions:
+        print(f"{title}：没有匹配的会话记录。")
+        print(f"(数据库: {DB_PATH})")
+        return
+
+    write_cache(sessions, origin_cwd, all_projects=all_projects,
+                project_path=project_path, grep=grep, time_range=time_range,
+                sort=sort)
+    active = active_session_ids()
+
+    if output in ("json", "csv"):
+        if output == "json":
+            emit_json(sessions, active)
+        else:
+            emit_csv(sessions, active)
+        return
+
+    tw, lw = compute_widths(all_projects, full)
+    rows = []
+    colors = [["1"] * (7 if all_projects else 6)]  # 表头: 粗体
+    for i, s in enumerate(sessions, 1):
+        is_active = s["id"] in active
+        topic = clean_prompt(s["title"]) or "(空会话)"
+        last = clean_prompt(s["last_prompt"]) or "—"
+        topic = ellipsize(topic, tw)
+        last = ellipsize(last, lw)
+        idx = f"{i}*" if is_active else str(i)
+        row = [idx, s["id"], topic, last, str(s["turns"]), format_time(s["time_updated"])]
+        rc = ["31" if is_active else "2", "2", None, "36", "2", "2"]
+        if all_projects:
+            row.insert(2, ellipsize(short_project(s["directory"]), PROJ_W))
+            rc.insert(2, "2")
+        rows.append(row)
+        colors.append(rc)
+
+    if all_projects:
+        headers = ["#", "Session ID", "项目", "主题", "最后对话", "轮次", "最后活动"]
+        aligns = ["r", "l", "l", "l", "l", "r", "r"]
+        widths = [3, SID_W, PROJ_W, tw, lw, 4, 11]
+    else:
+        headers = ["#", "Session ID", "主题", "最后对话", "轮次", "最后活动"]
+        aligns = ["r", "l", "l", "l", "r", "r"]
+        widths = [3, SID_W, tw, lw, 4, 11]
+
+    print(f"{title}（共 {len(sessions)} 个，{sort} 排序）:")
+    print()
+    print(render_table(headers, aligns, widths, rows, colors))
+    print()
+    n_active = len(active & {s["id"] for s in sessions})
+    print("恢复 mimoses <序号> · 全文 mimoses -x <序号> · 删除 mimoses -d <序号>")
+    if n_active:
+        print(f"(* 表示正在运行, 共 {n_active} 个)")
+
+
+# ---------------- 动作模式 ----------------
+def resume_mode(n):
+    sid, target_cwd, _ = resolve_session(n)
+    if not os.path.exists(MIMO_BIN):
+        print(f"找不到 mimo 可执行文件: {MIMO_BIN}", file=sys.stderr)
+        sys.exit(1)
+    print(f"→ 恢复会话 #{n}: {sid}")
+    if target_cwd and os.path.isdir(target_cwd):
+        try:
+            os.chdir(target_cwd)
+            print(f"  (在 {target_cwd} 下恢复)")
+        except OSError:
+            pass
+    os.execvp(MIMO_BIN, [MIMO_BIN, "-s", sid])
+
+
+def view_mode(n):
+    sid, target_cwd, _ = resolve_session(n)
+    if not os.path.exists(DB_PATH):
+        print(f"数据库不存在: {DB_PATH}", file=sys.stderr)
+        sys.exit(1)
+
+    con = connect_ro()
+    try:
+        info = con.execute(
+            "SELECT directory, title, time_created, time_updated "
+            "FROM session WHERE id=?", (sid,)).fetchone()
+        if not info:
+            print(f"会话不存在: {sid}", file=sys.stderr)
+            sys.exit(1)
+        dir_, title, tc, tu = info
+        turns = count_turns(con, sid)
+        size_bytes = estimate_size(con, sid)
+
+        print(c("1", f"会话 {sid}"))
+        if dir_:
+            print(f"  项目: {dir_}")
+        print(f"  主题: {clean_prompt(title) or '(空会话)'}")
+        print(f"  轮次: {turns}  大小: {round(size_bytes/1024,1)} KB  "
+              f"最后活动: {format_time(tu)}")
+        if sid in active_session_ids():
+            print("  状态: 正在运行")
+        print()
+        print(c("2", "=" * 70))
+
+        # 从 history_fts 拼接全文
+        rows = con.execute(
+            "SELECT kind, tool_name, body, time_created FROM history_fts "
+            "WHERE session_id=? ORDER BY time_created, rowid",
+            (sid,)).fetchall()
+        shown = 0
+        for kind, tool, body, tc_ms in rows:
+            ts = time_str(tc_ms)
+            if kind == "user_text":
+                print(c("32;1", f"[用户] {ts}"))
+                for ln in body.splitlines():
+                    print(f"  {ln}")
+                print()
+                shown += 1
+            elif kind == "assistant_text":
+                print(c("33", f"[助手] {ts}"))
+                for ln in body.splitlines():
+                    print(f"  {ln}")
+                print()
+                shown += 1
+            elif kind == "tool_input":
+                print(c("90", f"[工具·输入] {ts} · {tool or '?'}"))
+                for ln in (body[:VIEW_TRUNC]).splitlines():
+                    print(f"  {ln}")
+                if len(body) > VIEW_TRUNC:
+                    print(c("90", f"  …(截断, 全文 {len(body)} 字符)"))
+                print()
+            elif kind == "tool_error":
+                print(c("31", f"[工具·错误] {ts} · {tool or '?'}"))
+                for ln in (body[:VIEW_TRUNC]).splitlines():
+                    print(f"  {ln}")
+                if len(body) > VIEW_TRUNC:
+                    print(c("31", f"  …(截断, 全文 {len(body)} 字符)"))
+                print()
+        print(c("2", "=" * 70))
+        print(f"(共 {shown} 条对话)")
+    finally:
+        con.close()
+
+
+def time_str(ms):
+    if not ms:
+        return ""
+    return datetime.fromtimestamp(ms / 1000.0).strftime("%H:%M:%S")
+
+
+def delete_mode(n, assume_yes=False):
+    sid, target_cwd, cache = resolve_session(n)
+    if not os.path.exists(DB_PATH):
+        print(f"数据库不存在: {DB_PATH}", file=sys.stderr)
+        sys.exit(1)
+
+    if sid in active_session_ids():
+        print(f"会话 {sid} 正在运行，不能删除。请先退出该会话再删。",
+              file=sys.stderr)
+        sys.exit(1)
+
+    con = connect_ro()
+    try:
+        info = con.execute(
+            "SELECT directory, title, time_created, time_updated "
+            "FROM session WHERE id=?", (sid,)).fetchone()
+        if not info:
+            print(f"会话不存在(可能已删): {sid}", file=sys.stderr)
+            sys.exit(1)
+        dir_, title, tc, tu = info
+        turns = count_turns(con, sid)
+        size_bytes = estimate_size(con, sid)
+    finally:
+        con.close()
+
+    print("将删除(移入回收站, 可 --restore 恢复):")
+    print(f"  会话 ID : {sid}")
+    print(f"  项目    : {dir_}")
+    print(f"  主题    : {ellipsize(clean_prompt(title), 60)}")
+    print(f"  轮次    : {turns}")
+    print(f"  大小    : {round(size_bytes/1024,1)} KB")
+    print(f"  回收站  : {os.path.join(TRASH_DIR, f'<epoch>_{sid}')}/")
+
+    if not assume_yes:
+        try:
+            ans = input("确认删除? 输入 y 确认, 其他取消: ")
+        except (EOFError, KeyboardInterrupt):
+            print("\n已取消。")
+            return
+        if ans.strip().lower() not in ("y", "yes"):
+            print("已取消。")
+            return
+
+    entry = move_to_trash(sid, dir_, title)
+    print(f"已移入回收站: {entry}")
+    print(f"恢复: mimoses --restore <序号>  (先 mimoses --trash 查看)")
+    list_mode(
+        full=False,
+        all_projects=cache.get("list_all", False),
+        project_path=cache.get("list_project"),
+        grep=cache.get("list_grep"),
+        time_range=cache.get("list_time"),
+        sort=cache.get("list_sort", "time"),
+        output="table",
+    )
+
+
+def restore_mode(n):
+    entries = list_trash()
+    if not entries:
+        print("回收站为空。")
+        return
+    if n < 1 or n > len(entries):
+        print(f"序号 {n} 超出回收站范围(1..{len(entries)})，以下是回收站内容:",
+              file=sys.stderr)
+        print()
+        trash_mode()
+        return
+    entry, meta = entries[n - 1]
+    sid = meta.get("sid") or meta.get("session_id", "?")
+    print(f"恢复会话 {sid}（原项目 {meta.get('directory', '?')}）")
+    ok = restore_from_trash(entry, meta)
+    if ok:
+        print(f"已恢复: {sid}")
+    else:
+        print("恢复失败, 详见上方错误。", file=sys.stderr)
+
+
+def trash_mode():
+    entries = list_trash()
+    if not entries:
+        print("回收站为空。")
+        return
+    rows = []
+    for i, (entry, meta) in enumerate(entries, 1):
+        sid = meta.get("sid") or meta.get("session_id", "?")
+        title = meta.get("title") or ""
+        deleted_at = meta.get("trash_time") or ""
+        rows.append([
+            str(i), sid,
+            ellipsize(clean_prompt(title), 40),
+            ellipsize(deleted_at[:16].replace("T", " "), 17),
+            str(dir_size(entry)),
+        ])
+    headers = ["#", "Session ID", "主题", "删除时间", "大小(字节)"]
+    aligns = ["r", "l", "l", "r", "r"]
+    widths = [3, SID_W, 40, 17, 12]
+    print(f"回收站中的会话（共 {len(entries)} 个，最近删除在前）:")
+    print()
+    print(render_table(headers, aligns, widths, rows))
+    print()
+    print("恢复: mimoses --restore <序号>")
+
+
+# ---------------- 参数解析 ----------------
+def parse_args(argv):
+    p = argparse.ArgumentParser(
+        prog="mimoses",
+        description="列出/查看/恢复/删除 mimocode 会话",
+        formatter_class=argparse.RawDescriptionHelpFormatter,
+        epilog=__doc__.split("用法:", 1)[1] if "用法:" in (__doc__ or "") else None,
+    )
+    p.add_argument("idx", nargs="?", type=int,
+                   help="恢复第 N 个会话(需要先前运行列表命令)")
+
+    action = p.add_mutually_exclusive_group()
+    action.add_argument("-x", "--view", type=int, dest="view",
+                        help="展开第 N 个会话全文")
+    action.add_argument("-d", "--delete", type=int, dest="delete",
+                        help="删除第 N 个会话(移入回收站)")
+    action.add_argument("--restore", nargs="?", type=int, const=-1,
+                        help="恢复第 N 个; 省略 N 则列出回收站")
+    action.add_argument("--trash", action="store_true",
+                        help="列出回收站")
+
+    listing = p.add_argument_group("列表选项")
+    listing.add_argument("-a", "--all", action="store_true", help="列所有项目")
+    listing.add_argument("-p", "--project", help="列指定目录的会话")
+    listing.add_argument("-f", "--full", action="store_true", help="加宽文本列")
+    listing.add_argument("-g", "--grep", help="关键词过滤(全文搜索)")
+    listing.add_argument("-t", "--time", help="时间过滤: today/Nh/Nd/Nw")
+    listing.add_argument("--sort", default="time",
+                         choices=["time", "oldest", "size", "turns"])
+    out = p.add_mutually_exclusive_group()
+    out.add_argument("--json", action="store_true", help="JSON 输出")
+    out.add_argument("--csv", action="store_true", help="CSV 输出")
+    p.add_argument("-y", "--yes", action="store_true", help="删除跳过确认")
+
+    args = p.parse_args(argv)
+    return args
+
+
+def _validate(args, p):
+    """检查互斥关系"""
+    action_count = sum(1 for x in (args.view, args.delete, args.restore,
+                                   args.trash) if x is not None and x is not False)
+    if args.trash:
+        action_count = max(action_count, 1)
+    # 裸位置参数也算恢复动作
+    if args.idx is not None:
+        action_count += 1
+
+    if action_count > 1:
+        p.error("只能使用一个动作(恢复/查看/删除/restore/trash)")
+
+    listing_opts = (
+        args.all or args.project or args.full
+        or args.grep is not None or args.time is not None
+        or args.sort != "time" or args.json or args.csv
+    )
+    # 若用户传了 --restore 但没给 N (const=-1), 视为"列回收站"
+    if args.restore == -1:
+        args.trash = True
+        args.restore = None
+
+    if action_count >= 1 and listing_opts:
+        p.error("动作模式不能与列表选项(-a/-p/-f/-g/-t/--sort/--json/--csv)同时使用")
+
+
+def main(argv):
+    args = parse_args(argv[1:])
+    # argparse 无 -h 打印帮助, 已处理
+    p = argparse.ArgumentParser(prog="mimoses")
+    _validate(args, p)
+
+    if args.idx is not None:
+        if args.idx < 1:
+            print("序号须为正整数", file=sys.stderr)
+            return 2
+        resume_mode(args.idx)
+        return 0
+
+    if args.view is not None:
+        if args.view < 1:
+            print("查看序号须为正整数", file=sys.stderr)
+            return 2
+        view_mode(args.view)
+        return 0
+
+    if args.delete is not None:
+        if args.delete < 1:
+            print("删除序号须为正整数", file=sys.stderr)
+            return 2
+        delete_mode(args.delete, assume_yes=args.yes)
+        return 0
+
+    if args.trash:
+        trash_mode()
+        return 0
+
+    if args.restore is not None:
+        if args.restore < 1:
+            print("恢复序号须为正整数", file=sys.stderr)
+            return 2
+        restore_mode(args.restore)
+        return 0
+
+    output = "json" if args.json else ("csv" if args.csv else "table")
+    list_mode(full=args.full, all_projects=args.all,
+              project_path=args.project, grep=args.grep,
+              time_range=args.time, sort=args.sort, output=output)
+    return 0
+
+
+if __name__ == "__main__":
+    try:
+        sys.exit(main(sys.argv))
+    except KeyboardInterrupt:
+        print("\n已中断。")
+        sys.exit(130)
+    except BrokenPipeError:
+        try:
+            sys.stdout.close()
+        except Exception:
+            pass
+        sys.exit(0)
