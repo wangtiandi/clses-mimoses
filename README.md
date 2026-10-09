@@ -42,25 +42,35 @@ echo 'export PATH="$HOME/.local/bin:$PATH"' >> ~/.bashrc   # 或 ~/.zshrc
 
 ```
 <tool>                       列出当前项目(目录)的会话
-<tool> N                     恢复第 N 个会话
-<tool> -x N, --view N       展开第 N 个会话的全文对话
-<tool> -d N, --delete N     删除第 N 个会话（移入回收站; -y 跳过确认）
-<tool> --restore [N]        恢复第 N 个；省略 N 则列出回收站内容
-<tool> --trash              列出回收站
-<tool> -a, --all            列出所有项目的会话
-<tool> -p PATH              列出指定目录的会话
-<tool> -f, --full           加宽"主题/最后对话"列
-<tool> -g PAT               按关键词过滤
-<tool> -t RANGE             按时间过滤: today / 1h / 7d / 30d / 2w
-<tool> --sort KEY           排序: time(默认) / oldest / size / turns
-<tool> --json / --csv       以 JSON/CSV 输出
-<tool> -y, --yes            删除时跳过确认
-<tool> -h, --help           帮助
+<tool> N                     恢复第 N 个会话 (mimo -s <id>)
+<tool> SES_ID                恢复指定 session ID 的会话 (mimoses 用 ses_*；clses 用 UUID)
+<tool> -x [N|SES_ID]         展开会话的全文对话
+<tool> -d [N|SES_ID]         删除会话（移入回收站; -y 跳过确认）
+<tool> --restore [N]         恢复第 N 个；省略 N 则列出回收站内容
+<tool> --trash               列出回收站
+<tool> -a, --all             列出所有项目的会话
+<tool> -p PATH               列出指定目录的会话
+<tool> -f, --full            加宽"主题/最后对话"列(仅列表模式)
+<tool> -g PAT                按关键词过滤
+<tool> -t RANGE              按时间过滤: today / 1h / 7d / 30d / 2w
+<tool> --sort KEY            排序: time(默认) / oldest / size / turns
+<tool> --json / --csv        以 JSON/CSV 输出(仅列表模式)
+<tool> -y, --yes             删除时跳过确认
+<tool> -h, --help            帮助
 ```
+
+**选择器语义**：位置参数既可以是纯数字序号（对应最近一次列表），也可以是完整 session ID。过滤器（`-a/-p/-g/-t/--sort`）可与序号/ID 组合，语义是"在过滤后的列表里选第 N 个（或找到该 ID）"。ID + 过滤器为**严格模式**：ID 必须在过滤结果中，否则报错。`--json/--csv/--full` 不能与选择器组合。
 
 **表格列**：`# | Session ID | [项目] | 主题 | 最后对话 | 轮次 | 最后活动`。正在运行的会话在 `#` 列加 `*` 标记。
 
 示例：
+
+```
+$ mimoses -a -g 传奇 3          # 过滤"传奇"关键词，恢复结果里的第 3 个
+$ mimoses -x -a -g 传奇 ses_xxx # 在"传奇"结果里查看指定会话
+$ mimoses -d 1 -y               # 删除列表中第 1 个（-y 跳过确认）
+$ mimoses ses_f5807f6e6ffeOkIOlb4boSKdfh  # 完整 ID 直连恢复
+```
 
 ```
 $ clses
