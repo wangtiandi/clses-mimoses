@@ -51,7 +51,7 @@ echo 'export PATH="$HOME/.local/bin:$PATH"' >> ~/.bashrc   # 或 ~/.zshrc
 <tool> -a, --all             列出所有项目的会话
 <tool> -p PATH               列出指定目录的会话
 <tool> -f, --full            加宽"主题/最后对话"列(仅列表模式)
-<tool> -g PAT                按关键词过滤
+<tool> -g PAT                按关键词过滤(可多次使用, 多次为 AND 关系)
 <tool> -t RANGE              按时间过滤: today / 1h / 7d / 30d / 2w
 <tool> --sort KEY            排序: time(默认) / oldest / size / turns
 <tool> --json / --csv        以 JSON/CSV 输出(仅列表模式)
@@ -70,6 +70,9 @@ $ mimoses -a -g 传奇 3          # 过滤"传奇"关键词，恢复结果里的
 $ mimoses -x -a -g 传奇 ses_xxx # 在"传奇"结果里查看指定会话
 $ mimoses -d 1 -y               # 删除列表中第 1 个（-y 跳过确认）
 $ mimoses ses_f5807f6e6ffeOkIOlb4boSKdfh  # 完整 ID 直连恢复
+$ mimoses -a -g 传奇 -g Crystal       # AND: 同时含"传奇"和"Crystal"
+$ mimoses -a -g "传奇 OR Crystal"     # 单个 -g 内嵌 FTS5 语法(mimoses)
+$ mimoses -a -g '"Hello World"'      # FTS5 短语匹配(mimoses)
 ```
 
 ```
@@ -122,7 +125,7 @@ $ clses
 
 - `clses` 只在 macOS / Linux 上实测过。Windows 需要改 5 处 API（`os.kill`、`os.execvp`、`shutil.move` 遇到句柄锁、`isatty` VT 处理、cwd 编码规则）——**未验证**。
 - `mimoses` 依赖 mimocode 的 SQLite schema（`session` / `message` / `history_fts` / `actor_registry`）。若 mimocode 改版，需按新 schema 调整 `load_sessions` / `view_session` / `is_active` 里的 SQL。
-- `--grep` 用 SQLite FTS5（`mimoses`）或简单子串匹配（`clses`），不做正则。
+- `--grep` 用 SQLite FTS5（`mimoses`）或简单子串匹配（`clses`），不做正则。`mimoses` 支持多次 `-g` 传参（AND 关系）以及 FTS5 语法（短语 `"foo bar"`、`OR`、`NOT`）。
 
 ---
 

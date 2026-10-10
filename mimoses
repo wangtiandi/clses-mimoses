@@ -13,7 +13,7 @@
   mimoses -a, --all                列出所有项目会话
   mimoses -p PATH, --project PATH  列出指定目录的会话
   mimoses -f, --full               加宽"主题/最后对话"列(仅列表模式)
-  mimoses -g PAT, --grep PAT       按关键词过滤(全文搜索 history_fts)
+  mimoses -g PAT, --grep PAT       按关键词过滤(全文搜索 history_fts); 可多次使用, 多次为 AND 关系
   mimoses -t RANGE, --time RANGE   按时间过滤: today / 1h / 7d / 30d / 2w
   mimoses --sort KEY               排序: time(默认) / oldest / size / turns
   mimoses --json / --csv           以 JSON/CSV 输出(仅列表模式)
@@ -266,26 +266,36 @@ def filter_time(sessions, rng):
     return [s for s in sessions if (s["time_updated"] or 0) >= thr]
 
 
-def filter_grep(sessions, pat):
-    """FTS5 全文匹配 history_fts, 失败则回退到 title/last_prompt 子串匹配"""
+def filter_grep(sessions, pats):
+    """FTS5 全文匹配 history_fts_idx, 支持多 pat (AND 语义); 失败回退 title/last_prompt 子串 AND 匹配。
+    pats: list[str] 或 str (兼容旧调用), None/[] 不过滤。
+    FTS5 语法(短语/OR/NOT)直接透传, 多 pat 用原生 AND 连接。
+    """
+    if not pats:
+        return sessions
+    if isinstance(pats, str):
+        pats = [pats]
+
     try:
         con = connect_ro()
         try:
-            safe_pat = pat.replace('"', '""')
+            fts_expr = " AND ".join(pats)
             cur = con.execute(
-                "SELECT DISTINCT session_id FROM history_fts WHERE body MATCH ?",
-                (safe_pat,))
+                "SELECT DISTINCT h.session_id FROM history_fts_idx "
+                "JOIN history_fts h ON h.rowid = history_fts_idx.rowid "
+                "WHERE history_fts_idx MATCH ?",
+                (fts_expr,))
             fts_ids = {r[0] for r in cur.fetchall()}
         finally:
             con.close()
     except sqlite3.Error:
         fts_ids = set()
 
-    p = pat.lower()
+    lowered = [p.lower() for p in pats]
     return [
         s for s in sessions
         if s["id"] in fts_ids
-        or p in (s["title"] + " " + s["last_prompt"]).lower()
+        or all(p in (s["title"] + " " + s["last_prompt"]).lower() for p in lowered)
     ]
 
 
@@ -1053,7 +1063,8 @@ def parse_args(argv):
     listing.add_argument("-a", "--all", action="store_true", help="列所有项目")
     listing.add_argument("-p", "--project", help="列指定目录的会话")
     listing.add_argument("-f", "--full", action="store_true", help="加宽文本列")
-    listing.add_argument("-g", "--grep", help="关键词过滤(全文搜索)")
+    listing.add_argument("-g", "--grep", action="append",
+                         help="关键词过滤(全文搜索); 可多次使用, 多次为 AND")
     listing.add_argument("-t", "--time", help="时间过滤: today/Nh/Nd/Nw")
     listing.add_argument("--sort", default="time",
                          choices=["time", "oldest", "size", "turns"])
