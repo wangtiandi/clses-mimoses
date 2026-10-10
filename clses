@@ -12,7 +12,7 @@
   clses -a, --all                列出所有项目的会话
   clses -p PATH, --project PATH  列出指定目录的会话
   clses -f, --full               加宽"主题/最后对话"列
-  clses -g PAT, --grep PAT       按关键词过滤(主题/最后对话)
+  clses -g PAT, --grep PAT       按关键词过滤(主题/最后对话); 可多次使用, 多次为 AND 关系
   clses -t RANGE, --time RANGE   按时间过滤: today / 1h / 7d / 30d / 2w
   clses --sort KEY               排序: time(默认) / oldest / size / turns
   clses --json / --csv           以 JSON/CSV 输出(供管道/脚本)
@@ -525,11 +525,19 @@ def filter_time(sessions, rng):
     return [s for s in sessions if s["last_ts"] and s["last_ts"].astimezone() >= start]
 
 
-def filter_grep(sessions, pat):
-    p = pat.lower()
+def filter_grep(sessions, pats):
+    """子串匹配 first_prompt/last_prompt, 多 pat 为 AND 语义。
+    pats: list[str] 或 str (兼容旧调用), None/[] 不过滤。
+    """
+    if not pats:
+        return sessions
+    if isinstance(pats, str):
+        pats = [pats]
+    lowered = [p.lower() for p in pats]
     return [
         s for s in sessions
-        if p in (clean_prompt(s["first_prompt"]) + " " + clean_prompt(s["last_prompt"])).lower()
+        if all(p in (clean_prompt(s["first_prompt"]) + " " + clean_prompt(s["last_prompt"])).lower()
+               for p in lowered)
     ]
 
 
@@ -847,7 +855,7 @@ def main(argv):
     full = False
     all_projects = False
     project_path = None
-    grep = None
+    grep = []
     time_range = None
     sort = "time"
     output = "table"
@@ -908,7 +916,7 @@ def main(argv):
             v = _need_value(a, args, i)
             if v is None:
                 return 2
-            grep = v
+            grep.append(v)
             i += 1
         elif a in ("-t", "--time"):
             v = _need_value(a, args, i)
