@@ -14,6 +14,7 @@
   mimoses -p PATH, --project PATH  列出指定目录的会话
   mimoses -f, --full               加宽"主题/最后对话"列(仅列表模式)
   mimoses -g PAT, --grep PAT       按关键词过滤(全文搜索 history_fts); 可多次使用, 多次为 AND 关系
+  mimoses -U, --user-only          排除系统会话(checkpoint-writer/Auto Dream/Auto Distill)
   mimoses -t RANGE, --time RANGE   按时间过滤: today / 1h / 7d / 30d / 2w
   mimoses --sort KEY               排序: time(默认) / oldest / size / turns
   mimoses --json / --csv           以 JSON/CSV 输出(仅列表模式)
@@ -118,6 +119,16 @@ def connect_ro():
     return sqlite3.connect("file:" + DB_PATH + "?mode=ro", uri=True)
 
 
+SYSTEM_PREFIXES = ("checkpoint-writer:", "Auto Dream", "Auto Distill",
+                   "Auto Dream memory", "Auto Distill memory")
+
+
+def is_system_session(title):
+    """判断是否为系统自动生成的会话(非用户主动发起)"""
+    t = (title or "").strip()
+    return any(t.startswith(p) for p in SYSTEM_PREFIXES)
+
+
 def fetch_session_rows(cwd=None, all_projects=False, project_path=None):
     """拉取 (id, directory, title, time_created, time_updated) 的会话行"""
     con = connect_ro()
@@ -166,7 +177,7 @@ def estimate_size(con, sid):
 
 
 def load_sessions(cwd=None, all_projects=False, project_path=None,
-                  grep=None, time_range=None, sort="time"):
+                  grep=None, time_range=None, sort="time", user_only=False):
     """加载会话列表, 应用过滤/排序, 返回 dict 列表"""
     base_rows = fetch_session_rows(cwd=cwd, all_projects=all_projects,
                                    project_path=project_path)
@@ -177,6 +188,8 @@ def load_sessions(cwd=None, all_projects=False, project_path=None,
     try:
         results = []
         for sid, dir_, title, tc, tu in base_rows:
+            if user_only and is_system_session(title):
+                continue
             last = get_last_user_prompt(con, sid)
             turns = count_turns(con, sid)
             size_bytes = estimate_size(con, sid)
@@ -474,7 +487,7 @@ def active_session_ids():
 
 # ---------------- 缓存 ----------------
 def write_cache(sessions, origin_cwd, all_projects=False, project_path=None,
-                grep=None, time_range=None, sort="time"):
+                grep=None, time_range=None, sort="time", user_only=False):
     data = {
         "list": [{
             "id": s["id"],
@@ -491,6 +504,7 @@ def write_cache(sessions, origin_cwd, all_projects=False, project_path=None,
         "list_grep": grep,
         "list_time": time_range,
         "list_sort": sort,
+        "list_user_only": user_only,
     }
     try:
         with open(CACHE_FILE, "w", encoding="utf-8") as f:
@@ -629,7 +643,8 @@ def restore_from_trash(entry, meta):
 
 # ---------------- 列表模式 ----------------
 def list_mode(full=False, all_projects=False, project_path=None,
-              grep=None, time_range=None, sort="time", output="table"):
+              grep=None, time_range=None, sort="time", output="table",
+              user_only=False):
     cwd = os.getcwd()
     if project_path:
         origin_cwd = os.path.abspath(os.path.expanduser(project_path))
@@ -648,6 +663,7 @@ def list_mode(full=False, all_projects=False, project_path=None,
         grep=grep,
         time_range=time_range,
         sort=sort,
+        user_only=user_only,
     )
 
     if not sessions:
@@ -657,7 +673,7 @@ def list_mode(full=False, all_projects=False, project_path=None,
 
     write_cache(sessions, origin_cwd, all_projects=all_projects,
                 project_path=project_path, grep=grep, time_range=time_range,
-                sort=sort)
+                sort=sort, user_only=user_only)
     active = active_session_ids()
 
     if output in ("json", "csv"):
@@ -850,6 +866,7 @@ def delete_mode(target, args, assume_yes=False):
         time_range=args.time,
         sort=args.sort,
         output="table",
+        user_only=args.user_only,
     )
 
 
@@ -924,7 +941,7 @@ def any_filter(args):
     """是否启用了改变过滤/排序结果的选项(改变索引语义)"""
     return bool(args.all or args.project
                 or args.grep is not None or args.time is not None
-                or args.sort != "time")
+                or args.sort != "time" or args.user_only)
 
 
 def load_by_id(sid):
@@ -978,6 +995,7 @@ def resolve_target(selector, args):
             grep=args.grep,
             time_range=args.time,
             sort=args.sort,
+            user_only=args.user_only,
         )
         if args.project:
             origin_cwd = os.path.abspath(os.path.expanduser(args.project))
@@ -994,7 +1012,8 @@ def resolve_target(selector, args):
                         project_path=args.project,
                         grep=args.grep,
                         time_range=args.time,
-                        sort=args.sort)
+                        sort=args.sort,
+                        user_only=args.user_only)
             return sessions[val - 1]
         else:
             matches = [s for s in sessions if s["id"] == val]
@@ -1007,7 +1026,8 @@ def resolve_target(selector, args):
                         project_path=args.project,
                         grep=args.grep,
                         time_range=args.time,
-                        sort=args.sort)
+                        sort=args.sort,
+                        user_only=args.user_only)
             return matches[0]
 
     # 无过滤器
@@ -1065,6 +1085,8 @@ def parse_args(argv):
     listing.add_argument("-f", "--full", action="store_true", help="加宽文本列")
     listing.add_argument("-g", "--grep", action="append",
                          help="关键词过滤(全文搜索); 可多次使用, 多次为 AND")
+    listing.add_argument("-U", "--user-only", action="store_true",
+                         help="排除系统会话(checkpoint-writer/Auto Dream/Auto Distill)")
     listing.add_argument("-t", "--time", help="时间过滤: today/Nh/Nd/Nw")
     listing.add_argument("--sort", default="time",
                          choices=["time", "oldest", "size", "turns"])
@@ -1097,9 +1119,10 @@ def _validate(args, p):
             args.all or args.project or args.full
             or args.grep is not None or args.time is not None
             or args.sort != "time" or args.json or args.csv
+            or args.user_only
         )
         if listing_opts:
-            p.error("--restore/--trash 不能与列表选项(-a/-p/-f/-g/-t/--sort/--json/--csv)同时使用")
+            p.error("--restore/--trash 不能与列表选项(-a/-p/-f/-g/-t/--sort/--json/--csv/-U)同时使用")
         # 若用户传了 --restore 但没给 N (const=-1), 视为"列回收站"
         if has_restore and args.restore == -1:
             args.trash = True
@@ -1171,7 +1194,8 @@ def main(argv):
     output = "json" if args.json else ("csv" if args.csv else "table")
     list_mode(full=args.full, all_projects=args.all,
               project_path=args.project, grep=args.grep,
-              time_range=args.time, sort=args.sort, output=output)
+              time_range=args.time, sort=args.sort, output=output,
+              user_only=args.user_only)
     return 0
 
 
